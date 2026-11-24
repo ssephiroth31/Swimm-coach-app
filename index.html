@@ -1608,7 +1608,7 @@ body{font-weight:500;}
 // Change ce numéro à chaque mise à jour importante du fichier.
 // Au chargement, si l'utilisateur voit une version différente de la dernière stockée,
 // on force un reload propre pour contourner le cache iOS Safari agressif.
-const APP_VERSION = 'v2026-11-24-plan1';
+const APP_VERSION = 'v2026-11-24-plan2';
 
 (function checkVersion(){
   try {
@@ -2019,6 +2019,7 @@ async function reloadTable(table){
     } else if(table==='plan_weeks'){
       const rows = await supaGetAll('plan_weeks','?select=*&order=id.asc');
       if(!rows) return;
+      rows.forEach(w => planWeekOnServer.add(w.week_key));
       const remoteMap = new Map(rows.map(w => [w.week_key, w]));
       const localMap = new Map(Object.entries(DB.planWeeks||{}));
       const allKeys = new Set([...remoteMap.keys(), ...localMap.keys()]);
@@ -2026,7 +2027,11 @@ async function reloadTable(table){
       for(const wk of allKeys){
         const r = remoteMap.get(wk);
         const l = localMap.get(wk);
-        if(r && l){
+        const pend = planPendingCols.get(wk);
+        if(r && l && pend && pend.size){
+          merged[wk] = mergePendingPlanWeek(wk, r, l, pend);
+          syncSavePlanWeek(merged[wk], 0, [...pend]).catch(e=>console.error('re-push pw',e));
+        } else if(r && l){
           if(isRecentlySaved('plan_weeks', wk)) merged[wk] = l;
           else {
             const rTs = r.updated_at || '';
@@ -2128,32 +2133,46 @@ function backupPlanning(){
     Object.keys(localStorage).filter(x=>x.startsWith(PLAN_BACKUP_PREFIX)).sort().slice(0,-14).forEach(x=>localStorage.removeItem(x));
   } catch(e){}
 }
-// Ce que les sauvegardes du téléphone permettent de retrouver : semaines absentes ou vidées, événements absents.
-// Pour chaque semaine, la sauvegarde la plus récente qui la contient remplie l'emporte.
-function planningRestorable(){
+// Ce que les sauvegardes du téléphone permettent de retrouver. Règles anti-perte :
+// - une semaine n'est retrouvée que si elle est vide (ou absente) ICI et sur le serveur : jamais d'écrasement de ce
+//   qu'un autre téléphone a écrit, même plus tard que la sauvegarde ;
+// - un événement n'est retrouvé que si son mois n'a plus aucun événement (ici et sur le serveur) et qu'il n'a pas été
+//   supprimé volontairement depuis ce téléphone (on ne ressuscite pas ce qu'on a supprimé).
+// `srv` = lecture fraîche du serveur ({weeks: Map, events: lignes}) ; sans lui, simple estimation pour le bouton.
+const PLAN_DELETED_EVENTS_KEY = 'swimcoach_plan_deleted_events';
+function planDeletedEvents(){ try{ return new Set(JSON.parse(localStorage.getItem(PLAN_DELETED_EVENTS_KEY)||'[]')); }catch(e){ return new Set(); } }
+function rememberDeletedPlanEvent(id){
+  try{ const d=[...planDeletedEvents(), id].slice(-200); localStorage.setItem(PLAN_DELETED_EVENTS_KEY, JSON.stringify(d)); }catch(e){}
+}
+function planningRestorable(srv){
   const weeks = {}, events = {};
   try {
+    const deleted = planDeletedEvents();
+    const monthsWithEvents = new Set(Object.entries(DB.planEvents||{}).filter(([,l])=>(l||[]).length).map(([mk])=>mk));
+    if(srv) srv.events.forEach(e=>monthsWithEvents.add(e.month_key));
     const keys = Object.keys(localStorage).filter(x=>x.startsWith(PLAN_BACKUP_PREFIX)).sort(); // du plus ancien au plus récent
     keys.forEach(k=>{
       let o; try{ o=JSON.parse(localStorage.getItem(k)); }catch(e){ return; }
       Object.entries((o&&o.planWeeks)||{}).forEach(([wk,w])=>{
-        if(planWeekFilled(w) && !planWeekFilled(DB.planWeeks[wk])) weeks[wk] = w;
+        if(!planWeekFilled(w) || planWeekFilled(DB.planWeeks[wk])) return;
+        if(srv && planWeekFilled(srv.weeks.get(wk))) return;
+        weeks[wk] = w;
       });
       Object.entries((o&&o.planEvents)||{}).forEach(([mk,list])=>(list||[]).forEach(ev=>{
-        const here = (DB.planEvents[mk]||[]).some(e=>e.id===ev.id);
-        if(!here) events[ev.id] = {mk, ev};
+        if(monthsWithEvents.has(mk) || deleted.has(ev.id)) return;
+        events[ev.id] = {mk, ev};
       }));
     });
   } catch(e){}
   return {weeks, events, count: Object.keys(weeks).length + Object.keys(events).length};
 }
 // Restaure les semaines et événements retrouvés et les renvoie au serveur ; renvoie leur nombre.
-function restorePlanningBackup(){
-  const r = planningRestorable();
+function restorePlanningBackup(srv){
+  const r = planningRestorable(srv);
   const now = new Date().toISOString();
   Object.entries(r.weeks).forEach(([wk,w])=>{
     DB.planWeeks[wk] = {...w, updated_at: now}; // plus récent que la ligne vide du serveur : il l'emporte à la fusion
-    syncSavePlanWeek(DB.planWeeks[wk]);
+    syncSavePlanWeek(DB.planWeeks[wk], 0, ['content','km_target','zone']);
   });
   Object.values(r.events).forEach(({mk,ev})=>{
     DB.planEvents[mk]=DB.planEvents[mk]||[];
@@ -2171,9 +2190,24 @@ function updatePlanRestoreButton(){
   const sub = document.getElementById('plan-restore-sub');
   if(sub) sub.textContent = n>0 ? `${n} élément${n>1?'s':''} retrouvé${n>1?'s':''} dans la sauvegarde de ce téléphone` : '';
 }
-function onRestorePlanning(){
-  const n = restorePlanningBackup();
-  toast(n>0 ? `✅ ${n} élément${n>1?'s':''} de planification restauré${n>1?'s':''}` : 'Rien à restaurer');
+// Le serveur est lu juste avant : sans connexion, rien n'est restauré (on ne devine jamais l'état du serveur).
+async function onRestorePlanning(){
+  let sw, se;
+  try {
+    [sw, se] = await Promise.all([supaGetAll('plan_weeks','?select=*&order=id.asc'), supaGetAll('plan_events','?select=*&order=id.asc')]);
+  } catch(e){
+    toast('❗ Connexion nécessaire pour restaurer');
+    return;
+  }
+  // ce que le serveur contient déjà (rempli) est repris tel quel, jamais remplacé par la sauvegarde
+  (sw||[]).forEach(w=>{
+    if(planWeekFilled(w) && !planWeekFilled(DB.planWeeks[w.week_key])){
+      DB.planWeeks[w.week_key] = {week_key:w.week_key, season_start:w.season_start, content:w.content||'', km_target:w.km_target||0, zone:w.zone||'', updated_at:w.updated_at||''};
+    }
+    planWeekOnServer.add(w.week_key);
+  });
+  const n = restorePlanningBackup({ weeks: new Map((sw||[]).map(w=>[w.week_key,w])), events: se||[] });
+  toast(n>0 ? `✅ ${n} élément${n>1?'s':''} de planification restauré${n>1?'s':''}` : 'Rien à restaurer : le serveur est à jour');
 }
 
 // save() = local immédiat
@@ -2386,15 +2420,23 @@ async function loadFromSupabase(){
 
     // ── Plan weeks ──
     const remotePW = planWeeks || [];
+    remotePW.forEach(w => planWeekOnServer.add(w.week_key));
     const remotePWMap = new Map(remotePW.map(w => [w.week_key, w]));
     const localPWMap = new Map(Object.entries(DB.planWeeks || {}));
     const allPWKeys = new Set([...remotePWMap.keys(), ...localPWMap.keys()]);
     const mergedPW = {};
     const pwToPush = [];
+    const pwCols = new Map(); // semaine → colonnes à envoyer (modifications locales non confirmées)
     for(const wk of allPWKeys){
       const r = remotePWMap.get(wk);
       const l = localPWMap.get(wk);
-      if(r && l){
+      const pend = planPendingCols.get(wk);
+      if(r && l && pend && pend.size){
+        // modifications locales pas encore confirmées : réappliquées sur la version du serveur, colonnes seules
+        mergedPW[wk] = mergePendingPlanWeek(wk, r, l, pend);
+        pwToPush.push(mergedPW[wk]);
+        pwCols.set(wk, [...pend]);
+      } else if(r && l){
         const rTs = r.updated_at || '';
         const lTs = l.updated_at || '';
         if(lTs > rTs){ mergedPW[wk] = l; pwToPush.push(l); }
@@ -2428,7 +2470,7 @@ async function loadFromSupabase(){
       // Plan events
       peToPush.forEach(({ev,mKey}) => { syncSavePlanEvent(ev, mKey).catch(e=>console.error('push pe',e)); });
       // Plan weeks
-      pwToPush.forEach(w => { syncSavePlanWeek(w).catch(e=>console.error('push pw',e)); });
+      pwToPush.forEach(w => { syncSavePlanWeek(w, 0, pwCols.get(w.week_key)||null).catch(e=>console.error('push pw',e)); });
       // Présences (une par une pour éviter écrasements)
       presToPush.forEach(({session_key, swimmer_id}) => {
         const now = new Date().toISOString();
@@ -2769,6 +2811,7 @@ async function syncSavePlanEvent(ev, mKey){
 }
 async function syncDeletePlanEvent(evId){
   markSaving('plan_events', evId);
+  rememberDeletedPlanEvent(evId);
   try {
     await supa('DELETE','plan_events',null,`?id=eq.${evId}`);
   } catch(e){ console.error('[SYNC] delete error:', e.message); }
@@ -4272,31 +4315,80 @@ function realKmForWeek(mondayDate, sundayDate){
 }
 
 // Sync Supabase pour plan_weeks
-// Une écriture qui échoue ne doit jamais passer inaperçue : message visible et nouveaux essais
-// (avec la version locale la plus récente de la semaine, jamais une copie périmée).
+// Règles anti-perte :
+// - une semaine déjà connue du serveur n'est envoyée que COLONNE PAR COLONNE (celles qu'on a modifiées) : modifier
+//   la zone ne renvoie jamais un thème périmé qui effacerait ce qu'un autre téléphone vient d'écrire ;
+// - les colonnes modifiées mais pas encore confirmées par le serveur sont mémorisées (même si l'app est fermée) :
+//   à la resynchronisation, elles sont réappliquées sur la version du serveur au lieu de la remplacer en entier ;
+// - une écriture qui échoue est signalée et retentée avec la version locale la plus récente.
+const PLAN_PENDING_KEY = 'swimcoach_plan_pending';
+const planWeekOnServer = new Set();     // semaines dont on sait qu'une ligne existe sur le serveur
+const planPendingCols = new Map();      // semaine → Set(colonnes modifiées pas encore confirmées)
+try {
+  Object.entries(JSON.parse(localStorage.getItem(PLAN_PENDING_KEY)||'{}')).forEach(([wk,c])=>planPendingCols.set(wk,new Set(c)));
+} catch(e){}
+function savePlanPending(){
+  try {
+    const o = {};
+    planPendingCols.forEach((set,wk)=>{ if(set.size) o[wk]=[...set]; });
+    localStorage.setItem(PLAN_PENDING_KEY, JSON.stringify(o));
+  } catch(e){}
+}
+/** Fusion d'une semaine locale avec celle du serveur quand le téléphone a des modifications non confirmées :
+    le serveur fait foi, on y réapplique uniquement les colonnes modifiées ici. */
+function mergePendingPlanWeek(wk, r, l, pend){
+  const week = {...r, week_key: wk, season_start: r.season_start!=null ? r.season_start : l.season_start};
+  pend.forEach(c=>{ week[c] = l[c]; });
+  week.updated_at = (l.updated_at||'') > (r.updated_at||'') ? l.updated_at : new Date().toISOString();
+  return week;
+}
+
 const PLAN_SYNC_RETRY_MS = [5000, 20000, 60000];
-async function syncSavePlanWeek(weekData, attempt=0){
-  markSaving('plan_weeks', weekData.week_key);
-  const row = {
-    id: weekData.week_key,
-    week_key: weekData.week_key,
+async function syncSavePlanWeek(weekData, attempt=0, cols=null){
+  const wk = weekData.week_key;
+  markSaving('plan_weeks', wk);
+  if(cols && cols.length){
+    const set = planPendingCols.get(wk) || new Set();
+    cols.forEach(c=>set.add(c));
+    planPendingCols.set(wk, set);
+    savePlanPending();
+  }
+  const sending = planPendingCols.get(wk) ? [...planPendingCols.get(wk)] : [];
+  const full = {
+    id: wk,
+    week_key: wk,
     season_start: weekData.season_start,
     content: weekData.content || '',
     km_target: parseFloat(weekData.km_target) || 0,
     zone: weekData.zone || '',
     updated_at: weekData.updated_at || new Date().toISOString()
   };
+  if(sending.length && !planWeekOnServer.has(wk)){
+    // semaine que ce téléphone ne connaît pas encore : un autre téléphone a pu la créer entre-temps
+    try {
+      const ex = await supa('GET','plan_weeks','',`?id=eq.${encodeURIComponent(wk)}&select=id`);
+      if(Array.isArray(ex) && ex.length) planWeekOnServer.add(wk);
+    } catch(e){}
+  }
+  let row = full;
+  if(sending.length && planWeekOnServer.has(wk)){
+    row = { id: full.id, week_key: wk, season_start: full.season_start, updated_at: full.updated_at };
+    sending.forEach(c=>{ row[c] = full[c]; });
+  }
   try {
     // Upsert atomique (POST + merge-duplicates) : jamais de DELETE préalable,
     // donc si le réseau coupe, la semaine n'est pas perdue côté serveur.
     await supa('POST','plan_weeks',row,'');
+    planWeekOnServer.add(wk);
+    const set = planPendingCols.get(wk);
+    if(set){ sending.forEach(c=>set.delete(c)); if(!set.size) planPendingCols.delete(wk); savePlanPending(); }
     if(attempt>0){ showSyncBadge('✅ Planification envoyée'); setTimeout(()=>hideSyncBadge(), 2500); }
   } catch(e){
     console.error('[SYNC] plan_week error:', e.message);
     showSyncBadge('⚠️ Planification non envoyée');
     if(attempt < PLAN_SYNC_RETRY_MS.length){
       setTimeout(()=>{
-        const latest = DB.planWeeks && DB.planWeeks[weekData.week_key];
+        const latest = DB.planWeeks && DB.planWeeks[wk];
         if(latest) syncSavePlanWeek(latest, attempt+1);
       }, PLAN_SYNC_RETRY_MS[attempt]);
     }
@@ -4307,6 +4399,12 @@ async function syncSavePlanWeek(weekData, attempt=0){
 function savePlanWeek(weekKey, seasonStart, content, kmTarget, zone){
   if(!DB.planWeeks) DB.planWeeks = {};
   const existing = DB.planWeeks[weekKey] || {};
+  // colonnes réellement modifiées : rien de modifié = aucune écriture (pas de semaine vide créée pour rien)
+  const cols = [];
+  if(content != null && content !== (existing.content || '')) cols.push('content');
+  if(kmTarget != null && (parseFloat(kmTarget) || 0) !== (parseFloat(existing.km_target) || 0)) cols.push('km_target');
+  if(zone != null && zone !== (existing.zone || '')) cols.push('zone');
+  if(!cols.length) return;
   const data = {
     week_key: weekKey,
     season_start: seasonStart,
@@ -4317,7 +4415,7 @@ function savePlanWeek(weekKey, seasonStart, content, kmTarget, zone){
   };
   DB.planWeeks[weekKey] = data;
   save();
-  syncSavePlanWeek(data);
+  syncSavePlanWeek(data, 0, cols);
 }
 
 function renderPlan(){
