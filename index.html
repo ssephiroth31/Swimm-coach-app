@@ -1191,6 +1191,14 @@ body{font-weight:500;}
         <div class="legend-item"><div class="legend-dot" style="background:var(--text3)"></div>Note</div>
       </div>
 
+      <button class="plan-pdf-btn" id="plan-restore-btn" style="display:none" onclick="onRestorePlanning()">
+        <div class="plan-pdf-btn-icon">↩️</div>
+        <div class="plan-pdf-btn-info">
+          <div>Restaurer la planification</div>
+          <div class="plan-pdf-btn-sub" id="plan-restore-sub"></div>
+        </div>
+      </button>
+
       <button class="plan-pdf-btn" onclick="exportPlanPDF()">
         <div class="plan-pdf-btn-icon">📄</div>
         <div class="plan-pdf-btn-info">
@@ -1600,7 +1608,7 @@ body{font-weight:500;}
 // Change ce numéro à chaque mise à jour importante du fichier.
 // Au chargement, si l'utilisateur voit une version différente de la dernière stockée,
 // on force un reload propre pour contourner le cache iOS Safari agressif.
-const APP_VERSION = 'v2026-11-05-club4';
+const APP_VERSION = 'v2026-11-24-plan1';
 
 (function checkVersion(){
   try {
@@ -2006,7 +2014,7 @@ async function reloadTable(table){
       saveLocal();
       renderCalendar();
       if(selectedDay){ renderDayPanel(); }
-      renderPlan();
+      renderPlanFromSync();
 
     } else if(table==='plan_weeks'){
       const rows = await supaGetAll('plan_weeks','?select=*&order=id.asc');
@@ -2036,7 +2044,7 @@ async function reloadTable(table){
       }
       DB.planWeeks = merged;
       saveLocal();
-      renderPlan();
+      renderPlanFromSync();
 
     } else if(table==='groups'){
       const rows = await supaGetAll('groups','?select=*&order=sort_order.asc,id.asc');
@@ -2100,31 +2108,72 @@ function saveLocal(){
   localStorage.setItem('swimcoach_v2', JSON.stringify(DB));
   backupPlanning();
 }
-// Sauvegarde de secours de la planification (1 par jour, 7 jours gardés) — ne remplace
-// jamais une sauvegarde du jour par un contenu plus petit.
+// Sauvegarde de secours de la planification (1 par jour, 14 jours gardés). Le contenu compté est ce qui est
+// réellement rempli (une semaine vide ne compte pas) : une sauvegarde du jour n'est jamais remplacée
+// par un contenu moins rempli.
+const PLAN_BACKUP_PREFIX = 'swimcoach_plan_backup_';
+function planWeekFilled(w){ return !!(w && ((w.content||'').trim() || (w.zone||'').trim() || (parseFloat(w.km_target)||0) > 0)); }
+function planningScore(planWeeks, planEvents){
+  return Object.values(planWeeks||{}).filter(planWeekFilled).length
+       + Object.values(planEvents||{}).reduce((a,l)=>a+(l||[]).length,0);
+}
 function backupPlanning(){
   try {
-    const n = Object.keys(DB.planWeeks||{}).length + Object.values(DB.planEvents||{}).reduce((a,l)=>a+l.length,0);
+    const n = planningScore(DB.planWeeks, DB.planEvents);
     if(n===0) return;
-    const k = 'swimcoach_plan_backup_'+new Date().toISOString().slice(0,10);
+    const k = PLAN_BACKUP_PREFIX+new Date().toISOString().slice(0,10);
     const old = localStorage.getItem(k);
-    if(old){ const o=JSON.parse(old); if((o.n||0)>n) return; }
+    if(old){ const o=JSON.parse(old); if(planningScore(o.planWeeks,o.planEvents)>n) return; }
     localStorage.setItem(k, JSON.stringify({n, planWeeks:DB.planWeeks, planEvents:DB.planEvents}));
-    Object.keys(localStorage).filter(x=>x.startsWith('swimcoach_plan_backup_')).sort().slice(0,-7).forEach(x=>localStorage.removeItem(x));
+    Object.keys(localStorage).filter(x=>x.startsWith(PLAN_BACKUP_PREFIX)).sort().slice(0,-14).forEach(x=>localStorage.removeItem(x));
   } catch(e){}
 }
-// Restaure (dans la console ou via bouton) la meilleure sauvegarde de planification et la renvoie au serveur.
+// Ce que les sauvegardes du téléphone permettent de retrouver : semaines absentes ou vidées, événements absents.
+// Pour chaque semaine, la sauvegarde la plus récente qui la contient remplie l'emporte.
+function planningRestorable(){
+  const weeks = {}, events = {};
+  try {
+    const keys = Object.keys(localStorage).filter(x=>x.startsWith(PLAN_BACKUP_PREFIX)).sort(); // du plus ancien au plus récent
+    keys.forEach(k=>{
+      let o; try{ o=JSON.parse(localStorage.getItem(k)); }catch(e){ return; }
+      Object.entries((o&&o.planWeeks)||{}).forEach(([wk,w])=>{
+        if(planWeekFilled(w) && !planWeekFilled(DB.planWeeks[wk])) weeks[wk] = w;
+      });
+      Object.entries((o&&o.planEvents)||{}).forEach(([mk,list])=>(list||[]).forEach(ev=>{
+        const here = (DB.planEvents[mk]||[]).some(e=>e.id===ev.id);
+        if(!here) events[ev.id] = {mk, ev};
+      }));
+    });
+  } catch(e){}
+  return {weeks, events, count: Object.keys(weeks).length + Object.keys(events).length};
+}
+// Restaure les semaines et événements retrouvés et les renvoie au serveur ; renvoie leur nombre.
 function restorePlanningBackup(){
-  const keys = Object.keys(localStorage).filter(x=>x.startsWith('swimcoach_plan_backup_'));
-  let best=null; keys.forEach(k=>{ try{ const o=JSON.parse(localStorage.getItem(k)); if(!best||o.n>best.n) best=o; }catch(e){} });
-  if(!best) return 0;
-  Object.entries(best.planWeeks||{}).forEach(([wk,w])=>{ if(!DB.planWeeks[wk]){ DB.planWeeks[wk]=w; syncSavePlanWeek(w); } });
-  Object.entries(best.planEvents||{}).forEach(([mk,list])=>list.forEach(ev=>{
+  const r = planningRestorable();
+  const now = new Date().toISOString();
+  Object.entries(r.weeks).forEach(([wk,w])=>{
+    DB.planWeeks[wk] = {...w, updated_at: now}; // plus récent que la ligne vide du serveur : il l'emporte à la fusion
+    syncSavePlanWeek(DB.planWeeks[wk]);
+  });
+  Object.values(r.events).forEach(({mk,ev})=>{
     DB.planEvents[mk]=DB.planEvents[mk]||[];
-    if(!DB.planEvents[mk].some(e=>e.id===ev.id)){ DB.planEvents[mk].push(ev); syncSavePlanEvent(ev,mk); }
-  }));
+    DB.planEvents[mk].push(ev);
+    syncSavePlanEvent(ev,mk);
+  });
   saveLocal(); renderPlan(); renderCalendar();
-  return best.n;
+  return r.count;
+}
+function updatePlanRestoreButton(){
+  const btn = document.getElementById('plan-restore-btn');
+  if(!btn) return;
+  const n = planningRestorable().count;
+  btn.style.display = n>0 ? 'flex' : 'none';
+  const sub = document.getElementById('plan-restore-sub');
+  if(sub) sub.textContent = n>0 ? `${n} élément${n>1?'s':''} retrouvé${n>1?'s':''} dans la sauvegarde de ce téléphone` : '';
+}
+function onRestorePlanning(){
+  const n = restorePlanningBackup();
+  toast(n>0 ? `✅ ${n} élément${n>1?'s':''} de planification restauré${n>1?'s':''}` : 'Rien à restaurer');
 }
 
 // save() = local immédiat
@@ -2715,6 +2764,7 @@ async function syncSavePlanEvent(ev, mKey){
     const result = await supa('POST','plan_events',row,'');
   } catch(e){
     console.error('[SYNC] plan_event error:', e.message);
+    showSyncBadge('⚠️ Événement non envoyé');
   }
 }
 async function syncDeletePlanEvent(evId){
@@ -4222,7 +4272,10 @@ function realKmForWeek(mondayDate, sundayDate){
 }
 
 // Sync Supabase pour plan_weeks
-async function syncSavePlanWeek(weekData){
+// Une écriture qui échoue ne doit jamais passer inaperçue : message visible et nouveaux essais
+// (avec la version locale la plus récente de la semaine, jamais une copie périmée).
+const PLAN_SYNC_RETRY_MS = [5000, 20000, 60000];
+async function syncSavePlanWeek(weekData, attempt=0){
   markSaving('plan_weeks', weekData.week_key);
   const row = {
     id: weekData.week_key,
@@ -4237,8 +4290,16 @@ async function syncSavePlanWeek(weekData){
     // Upsert atomique (POST + merge-duplicates) : jamais de DELETE préalable,
     // donc si le réseau coupe, la semaine n'est pas perdue côté serveur.
     await supa('POST','plan_weeks',row,'');
+    if(attempt>0){ showSyncBadge('✅ Planification envoyée'); setTimeout(()=>hideSyncBadge(), 2500); }
   } catch(e){
     console.error('[SYNC] plan_week error:', e.message);
+    showSyncBadge('⚠️ Planification non envoyée');
+    if(attempt < PLAN_SYNC_RETRY_MS.length){
+      setTimeout(()=>{
+        const latest = DB.planWeeks && DB.planWeeks[weekData.week_key];
+        if(latest) syncSavePlanWeek(latest, attempt+1);
+      }, PLAN_SYNC_RETRY_MS[attempt]);
+    }
   }
 }
 
@@ -4260,10 +4321,15 @@ function savePlanWeek(weekKey, seasonStart, content, kmTarget, zone){
 }
 
 function renderPlan(){
+  flushPlanTyping(); // ce qui est en cours de saisie est enregistré avant que les champs soient reconstruits
+  planRenderDeferred = false;
   // Saison : septembre planYear → août (planYear+1)
   const seasonEnd = planYear + 1;
   document.getElementById('plan-year-label').textContent=`${planYear}–${String(seasonEnd).slice(2)}`;
   const timeline=document.getElementById('plan-timeline');
+  const openMonths = new Set([...timeline.querySelectorAll('.plan-month-block.open')].map(b=>b.dataset.month));
+  const planScroll = document.getElementById('view-plan');
+  const planScrollTop = planScroll ? planScroll.scrollTop : 0;
   timeline.innerHTML='';
 
   // 12 mois de septembre (m=8, année=planYear) à août (m=7, année=planYear+1)
@@ -4372,14 +4438,16 @@ function renderPlan(){
               data-week="${w.weekKey}"
               data-field="zone"
               data-season="${planYear}"
-              onchange="onPlanWeekChange('${w.weekKey}', ${planYear})">
+              oninput="onPlanWeekInput('${w.weekKey}', ${planYear}, this)"
+              onchange="onPlanWeekChange('${w.weekKey}', ${planYear}, this)">
             <label class="plan-week-field-label" style="margin-top:10px">📝 Thème de la semaine</label>
             <textarea class="plan-week-textarea"
               placeholder="Objectifs, contenu, notes..."
               data-week="${w.weekKey}"
               data-field="theme"
               data-season="${planYear}"
-              onchange="onPlanWeekChange('${w.weekKey}', ${planYear})">${escapeHtml(wd.content||'')}</textarea>
+              oninput="onPlanWeekInput('${w.weekKey}', ${planYear}, this)"
+              onchange="onPlanWeekChange('${w.weekKey}', ${planYear}, this)">${escapeHtml(wd.content||'')}</textarea>
             <div class="plan-week-km-row">
               <div class="plan-week-km-target">
                 <label class="plan-week-field-label">🎯 Objectif km</label>
@@ -4389,7 +4457,8 @@ function renderPlan(){
                   data-week="${w.weekKey}"
                   data-field="km"
                   data-season="${planYear}"
-                  onchange="onPlanWeekChange('${w.weekKey}', ${planYear})">
+                  oninput="onPlanWeekInput('${w.weekKey}', ${planYear}, this)"
+              onchange="onPlanWeekChange('${w.weekKey}', ${planYear}, this)">
               </div>
               <div class="plan-week-km-real ${kmClass}">
                 <div class="plan-week-km-real-label">🏊 Réal.</div>
@@ -4403,7 +4472,8 @@ function renderPlan(){
     }).join('');
 
     const block=document.createElement('div');
-    block.className='plan-month-block';
+    block.className='plan-month-block'+(openMonths.has(mKey)?' open':'');
+    block.dataset.month=mKey;
     block.innerHTML=`
       <div class="plan-month-header" onclick="togglePlanMonth(this,'${mKey}')">
         <div class="plan-month-name">${MFR[m]} ${y}</div>
@@ -4439,6 +4509,8 @@ function renderPlan(){
       </div>`;
     timeline.appendChild(block);
   });
+  if(planScroll) planScroll.scrollTop = planScrollTop;
+  updatePlanRestoreButton();
 }
 
 // Handler unique pour changer texte OU km (déclenché au blur ou changement)
@@ -4706,20 +4778,64 @@ ${monthsHtml}
   else { toast('❗ Autorise les pop-ups pour générer le PDF'); }
 }
 
-function onPlanWeekChange(wKey, seasonStart){
+/* ── Saisie dans la planification ──
+   Un champ s'enregistre quand on le quitte (change), après une courte pause de frappe (input) et dès que
+   l'app est masquée. Sur iPhone, toucher la barre du bas, verrouiller l'écran ou fermer l'app sans sortir
+   du champ ne déclenche jamais `change` : le texte tapé était perdu. */
+const PLAN_TYPING_PAUSE_MS = 600;
+const planTyping = new Map();      // weekKey+champ → { timer, season, el }
+let planRenderDeferred = false;    // une synchro a demandé un nouvel affichage pendant une saisie
+
+function planTypingKey(el){ return `${el.dataset.week}|${el.dataset.field}`; }
+
+function onPlanWeekInput(wKey, seasonStart, el){
+  const k = planTypingKey(el);
+  const prev = planTyping.get(k);
+  if(prev) clearTimeout(prev.timer);
+  planTyping.set(k, { season: seasonStart, el, timer: setTimeout(()=>{
+    planTyping.delete(k);
+    onPlanWeekChange(wKey, seasonStart, el, true);
+  }, PLAN_TYPING_PAUSE_MS) });
+}
+
+/** Enregistre tout de suite ce qui est en cours de saisie. */
+function flushPlanTyping(){
+  for(const [k, p] of [...planTyping]){
+    clearTimeout(p.timer);
+    planTyping.delete(k);
+    onPlanWeekChange(p.el.dataset.week, p.season, p.el, true);
+  }
+}
+
+// Handler unique : enregistre le champ modifié (celui de l'exemplaire où l'on a tapé) et recopie sa valeur
+// dans les autres exemplaires de la semaine (semaine à cheval sur deux mois = affichée deux fois).
+function onPlanWeekChange(wKey, seasonStart, el, typing){
+  if(el && el.dataset){
+    const k = planTypingKey(el);
+    const p = planTyping.get(k);
+    if(p){ clearTimeout(p.timer); planTyping.delete(k); }
+    const f = el.dataset.field;
+    // un nombre à moitié tapé (« 12, ») donne une valeur vide : on attend la fin de la saisie
+    if(typing && f==='km' && el.validity && el.validity.badInput) return;
+    savePlanWeek(wKey, seasonStart,
+      f==='theme' ? el.value : null,
+      f==='km'    ? el.value : null,
+      f==='zone'  ? el.value : null);
+    syncWeekFieldsVisually(wKey, el);
+    return;
+  }
   const textarea = document.querySelector(`textarea[data-field="theme"][data-week="${wKey}"]`);
   const zoneInput = document.querySelector(`input[data-field="zone"][data-week="${wKey}"]`);
   const kmInput = document.querySelector(`input[data-field="km"][data-week="${wKey}"]`);
-  const content = textarea ? textarea.value : null;
-  const zone = zoneInput ? zoneInput.value : null;
-  const kmTarget = kmInput ? kmInput.value : null;
-  savePlanWeek(wKey, seasonStart, content, kmTarget, zone);
+  savePlanWeek(wKey, seasonStart,
+    textarea ? textarea.value : null,
+    kmInput ? kmInput.value : null,
+    zoneInput ? zoneInput.value : null);
   syncWeekFieldsVisually(wKey);
 }
 
-// Synchronise visuellement toutes les instances d'une même semaine
-// (utilisé pour les semaines à cheval sur 2 mois affichées 2 fois)
-function syncWeekFieldsVisually(wKey){
+// Synchronise visuellement toutes les instances d'une même semaine, à partir de l'exemplaire modifié
+function syncWeekFieldsVisually(wKey, srcEl){
   const sources = document.querySelectorAll(`[data-week="${wKey}"]`);
   if(sources.length < 2) return;
   const groups = {theme:[], zone:[], km:[]};
@@ -4729,12 +4845,29 @@ function syncWeekFieldsVisually(wKey){
   });
   Object.keys(groups).forEach(f=>{
     if(groups[f].length < 2) return;
-    const val = groups[f][0].value;
-    for(let i=1;i<groups[f].length;i++){
-      if(groups[f][i].value !== val) groups[f][i].value = val;
-    }
+    const src = (srcEl && srcEl.dataset.field===f && groups[f].includes(srcEl)) ? srcEl : groups[f][0];
+    const val = src.value;
+    groups[f].forEach(el=>{ if(el!==src && el.value !== val) el.value = val; });
   });
 }
+
+/** Un champ de la planification a le focus ou du texte en attente : on ne reconstruit pas l'écran sous les doigts. */
+function planFieldBusy(){
+  const a = document.activeElement;
+  return planTyping.size>0 || !!(a && a.dataset && a.dataset.week && a.closest && a.closest('#plan-timeline'));
+}
+/** Affichage demandé par une synchro (temps réel) : reporté tant qu'on tape, puis fait à la sortie du champ. */
+function renderPlanFromSync(){
+  if(planFieldBusy()){ planRenderDeferred = true; return; }
+  renderPlan();
+}
+document.addEventListener('focusout', ()=>{
+  if(!planRenderDeferred) return;
+  setTimeout(()=>{ if(planRenderDeferred && !planFieldBusy()) renderPlan(); }, 80);
+});
+// App masquée (écran verrouillé, autre app) ou fermée : on enregistre ce qui est en cours de saisie
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='hidden') flushPlanTyping(); });
+window.addEventListener('pagehide', flushPlanTyping);
 
 // Helper : escapeHtml pour les textareas (au cas où pas déjà défini)
 if(typeof escapeHtml === 'undefined'){
@@ -4834,6 +4967,7 @@ document.getElementById('plan-next-year').addEventListener('click',()=>{ planYea
    NAVIGATION
 ════════════════════════════════ */
 function showView(id){
+  flushPlanTyping();
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('view-'+id).classList.add('active');
