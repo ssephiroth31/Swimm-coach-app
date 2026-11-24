@@ -1608,7 +1608,7 @@ body{font-weight:500;}
 // Change ce numéro à chaque mise à jour importante du fichier.
 // Au chargement, si l'utilisateur voit une version différente de la dernière stockée,
 // on force un reload propre pour contourner le cache iOS Safari agressif.
-const APP_VERSION = 'v2026-11-24-plan2';
+const APP_VERSION = 'v2026-11-24-plan3';
 
 (function checkVersion(){
   try {
@@ -2036,7 +2036,7 @@ async function reloadTable(table){
           else {
             const rTs = r.updated_at || '';
             const lTs = l.updated_at || '';
-            merged[wk] = lTs > rTs ? l : r;
+            merged[wk] = (lTs > rTs && !(planWeekFilled(r) && !planWeekFilled(l))) ? l : r;
           }
         } else if(r){
           if(!isRecentlySaved('plan_weeks', wk)) merged[wk] = r;
@@ -2044,7 +2044,7 @@ async function reloadTable(table){
           // Une semaine n'est jamais supprimée dans l'appli : si le serveur ne l'a pas,
           // c'est une perte côté serveur → on garde le local et on le renvoie.
           merged[wk] = l;
-          syncSavePlanWeek(l).catch(e=>console.error('re-push pw',e));
+          if(planWeekFilled(l)) syncSavePlanWeek(l).catch(e=>console.error('re-push pw',e));
         }
       }
       DB.planWeeks = merged;
@@ -2439,13 +2439,15 @@ async function loadFromSupabase(){
       } else if(r && l){
         const rTs = r.updated_at || '';
         const lTs = l.updated_at || '';
-        if(lTs > rTs){ mergedPW[wk] = l; pwToPush.push(l); }
+        // une copie locale VIDE ne remplace jamais une semaine remplie du serveur (même plus récente) :
+        // un vidage volontaire passe par les modifications en attente (ci-dessus), pas par un horodatage
+        if(lTs > rTs && !(planWeekFilled(r) && !planWeekFilled(l))){ mergedPW[wk] = l; pwToPush.push(l); }
         else { mergedPW[wk] = r; }
       } else if(r){
         mergedPW[wk] = r;
       } else if(l){
         mergedPW[wk] = l;
-        pwToPush.push(l);
+        if(planWeekFilled(l)) pwToPush.push(l); // une semaine vide n'existant que sur ce téléphone n'est pas envoyée
       }
     }
     DB.planWeeks = mergedPW;
